@@ -244,6 +244,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        team2.stop()
         saber.stop()
         saber.close()
         picam2.stop()
