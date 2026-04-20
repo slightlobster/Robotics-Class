@@ -1,5 +1,6 @@
 import time
 import cv2
+import pygame
 
 # Hardware imports from the actual project structure
 from ps5_controller import PS5_Controller
@@ -93,6 +94,11 @@ class MinimalTeam1Controller:
         
         self.imu = IMUInterface()
         self.imu.zero_reference()
+
+        self.ps5_interval = 0.02
+        self.ps5_last_check = time.time()
+
+        self.paused = True
         
         self.picam2 = None
         if CAMERA_AVAILABLE:
@@ -112,62 +118,79 @@ class MinimalTeam1Controller:
     def run(self):
         print("Starting Minimal Team 1 Controller (Lane Follow Only)...")
         print("Press PS5 Cross button (or Ctrl+C) to quit.")
+        print("Press PS5 Circle button to start.")
+        print("Press PS5 Square button to stop.")
         
         try:
             while self.running:
                 loop_start = time.time()
                 self.sensors.now = loop_start
+
+                # Controller checks
+                now = time.time()
+                if now - self.ps5_last_check >= self.ps5_interval:
+                    pygame.event.pump()
+                    self.ps5.check_controls()
+                    self.ps5_last_check = now
                 
                 # --- A. READ INPUT & SENSORS ---
                 # Check PS5 controller for emergency stop or exit
-                self.ps5.check_controls()
                 if self.ps5.control_request["reqCross"]:
                     print("Cross button pressed. Exiting...")
                     self.running = False
                     break
+                if self.ps5.control_request["reqSquare"]:
+                    print("Square button pressed. Pausing...")
+                    self.paused = True
+                if self.ps5.control_request["reqCircle"]:
+                    print("Circle button pressed. Resuming...")
+                    self.paused = False
+                if self.ps5.control_request.get("reqMade", False):
+                    self.ps5.reset_controller_state()
                 
-                # Read IMU
-                self.sensors.imu_delta = self.imu.get_delta()
-                
-                # Grab the latest camera frame
-                if self.picam2 is not None:
-                    try:
-                        # Capture as a BGR numpy array compatible with OpenCV
-                        self.sensors.frame = self.picam2.capture_array()
-                    except Exception as e:
-                        print(f"Frame capture error: {e}")
-                        self.sensors.frame = None
-                else:
-                    print("self.picam2 is None")
-                
-                if self.sensors.frame is None:
-                    time.sleep(0.01)
-                    print("here 3")
-                    continue
-
-                # --- B. PROCESS TEAM 1 LOGIC ---
-                updates = self.team1.update(self.state, self.sensors)
-                print(updates)
-                
-                # --- C. APPLY MOTOR COMMANDS ---
-                if "drive_command" in updates:
-                    speed = updates["drive_command"].get("speed", 0)
-                    turn = updates["drive_command"].get("turn", 0)
+                if not self.paused:
+                    # Read IMU
+                    self.sensors.imu_delta = self.imu.get_delta()
                     
-                    # Send to Sabertooth motors
-                    self.saber.drive(speed, turn)
+                    # Grab the latest camera frame
+                    if self.picam2 is not None:
+                        try:
+                            # Capture as a BGR numpy array compatible with OpenCV
+                            self.sensors.frame = self.picam2.capture_array()
+                        except Exception as e:
+                            print(f"Frame capture error: {e}")
+                            self.sensors.frame = None
+                    else:
+                        print("self.picam2 is None")
                     
-                # Check for an IMU reset request
-                if updates.get("reset_imu", False):
-                    print("Team 1 requested IMU reset.")
-                    self.imu.zero_reference()
-                    self.sensors.imu_delta = 0.0
+                    if self.sensors.frame is None:
+                        time.sleep(0.01)
+                        print("here 3")
+                        continue
 
-                # --- D. LOOP TIMING ---
-                # Maintain roughly 30Hz loop rate (0.033s)
-                elapsed = time.time() - loop_start
-                sleep_time = max(0.0, 0.033 - elapsed)
-                time.sleep(sleep_time)
+                    # --- B. PROCESS TEAM 1 LOGIC ---
+                    updates = self.team1.update(self.state, self.sensors)
+                    print(updates)
+                    
+                    # --- C. APPLY MOTOR COMMANDS ---
+                    if "drive_command" in updates:
+                        speed = updates["drive_command"].get("speed", 0)
+                        turn = updates["drive_command"].get("turn", 0)
+                        
+                        # Send to Sabertooth motors
+                        self.saber.drive(speed, turn)
+                        
+                    # Check for an IMU reset request
+                    if updates.get("reset_imu", False):
+                        print("Team 1 requested IMU reset.")
+                        self.imu.zero_reference()
+                        self.sensors.imu_delta = 0.0
+
+                    # --- D. LOOP TIMING ---
+                    # Maintain roughly 30Hz loop rate (0.033s)
+                    elapsed = time.time() - loop_start
+                    sleep_time = max(0.0, 0.033 - elapsed)
+                    time.sleep(sleep_time)
                 
         except KeyboardInterrupt:
             print("\nKeyboardInterrupt caught. Stopping robot...")
@@ -179,6 +202,7 @@ class MinimalTeam1Controller:
         self.saber.stop()
         if self.picam2 is not None:
             self.picam2.stop()
+        print("here man.")
         self.imu.close()
         print("Done.")
 
