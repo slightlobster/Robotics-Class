@@ -5,10 +5,22 @@ import signal
 from multiprocessing import shared_memory
 from typing import Any, Dict, Optional
 
-import cv2
 import numpy as np
 
-from robot_types import AutoRoadLocation
+from robot_types import AutoRoadLocation, IntersectionStage
+
+try:
+    from ultralytics import YOLO, settings as _yolo_settings
+    import ultralytics.utils as _yolo_utils
+    import ultralytics.utils.downloads as _yolo_downloads
+    _yolo_settings.update({"sync": False})
+    _yolo_utils.ONLINE = False
+    _yolo_downloads.get_github_assets = lambda *_, **__: ("", [])  # suppress GitHub API calls
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO = None
+    YOLO_AVAILABLE = False
+
 from robot_utils import replace_latest_queue_item
 
 
@@ -95,9 +107,7 @@ class Team2Intersection:
         {
             "frame_id": frame_id,
             "sign_read_ready": True,
-            "intersection_roi": (180, 220, 280, 180),
             "intersection_lines": [(200, 400, 260, 290), (430, 400, 370, 290)],
-            "intersection_points": [(320, 290)],
             "intersection_label": "Road edges opening into intersection",
             "debug": "Intersection candidate detected from lane-edge geometry"
         }
@@ -125,11 +135,33 @@ class Team2Intersection:
     detection strategy without changing the controller.
     """
 
+    # --- Detection constants ---
+    MODEL_PATH            = str(__import__("pathlib").Path(__file__).resolve().parent.parent / "best.pt")
+    SIGN_DETECT_CONF      = 0.3   # YOLO confidence threshold
+    SIGN_READ_MIN_HEIGHT  = 100    # px — lower bound of reading window; sign_read_ready fires here
+    SIGN_HEIGHT_THRESHOLD = 225   # px — upper bound; robot is at intersection, pause_point_ready fires here
+    FORWARD_DRIVE_SECONDS = 3.5   # seconds in PRE_TURN_TRAVEL before turn_point_ready fires
+
     def __init__(self) -> None:
         self.last_debug = "Team 2 initialized"
         self.current_phase = "SEEKING_INTERSECTION"
         self.phase_started_at = 0.0
         self.phase_confirmation_seconds = 0.20
+
+        # YOLO model (lazy-loaded on first frame to avoid fork issues)
+        self.model = None
+
+        # Sign detection state
+        self.last_sign_height = 0       # bounding-box height of best detection this frame
+        self.sign_visible = False        # True if YOLO found a sign this frame
+        self.max_sign_height_seen = 0   # peak height since last reset (for drove-past check)
+
+        # Turn-point timer — starts when controller enters PRE_TURN_TRAVEL
+        self.forward_drive_started_at = 0.0
+
+        # Per-frame context set at the top of process() for use in milestone methods
+        self._current_timestamp = 0.0
+        self._current_stage = ""
 
     def process(self, frame_bgr: np.ndarray, job: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -154,14 +186,12 @@ class Team2Intersection:
         auto_mode = bool(job.get("auto_mode", False))
         timestamp = float(job.get("timestamp", 0.0))
         road_location_name = job.get("road_location", AutoRoadLocation.IN_TRAVEL_LANE.value)
-        roi_xywh = job.get("roi_xywh")
+        # Store per-frame context for milestone methods
+        self._current_timestamp = timestamp
+        self._current_stage = job.get("intersection_stage", "")
 
         result: Dict[str, Any] = {
             "frame_id": frame_id,
-            "intersection_roi": roi_xywh,
-            "intersection_boxes": [],
-            "intersection_lines": [],
-            "intersection_points": [],
             "intersection_label": "",
             "debug": "",
         }
@@ -182,10 +212,10 @@ class Team2Intersection:
             result["debug"] = "Team 2: no frame available"
             return result
 
-        work_frame, roi_xywh = self.extract_intersection_roi(frame_bgr, roi_xywh)
-        result["intersection_roi"] = roi_xywh
+        # Keep a reference to the full frame so _run_yolo can use it regardless of ROI
+        self._full_frame = frame_bgr
 
-        detection = self.detect_intersection_features(work_frame, roi_xywh)
+        detection = self.detect_intersection_features()
         result.update(detection)
 
         result["sign_read_ready"] = self.sign_read_ready(detection)
@@ -236,57 +266,85 @@ class Team2Intersection:
         roi_y = int(frame_height * 0.50)
         return roi_x, roi_y, roi_w, roi_h
 
-    def detect_intersection_features(
-        self,
-        roi_bgr: np.ndarray,
-        roi_xywh: tuple[int, int, int, int],
-    ) -> Dict[str, Any]:
+    def _run_yolo(self, frame_bgr: np.ndarray) -> tuple:
         """
-        Starting framework for Team 2 intersection detection.
+        Run YOLO on the full frame and return the tallest detected sign.
 
-        Students should replace the placeholder logic here.
+        Returns (sign_height, label, conf, bbox_xywh) where bbox_xywh is in
+        absolute frame coordinates. Returns (0, "", 0.0, None) when no sign
+        is found or YOLO is unavailable.
 
-        The framework supports several annotation styles:
-        - intersection_lines
-        - intersection_points
-        - intersection_boxes
-        - intersection_label
-
-        This starter implementation performs a very simple edge + Hough-lines
-        pass so students can see how data should flow back.
+        Updates self.last_sign_height, self.sign_visible, and
+        self.max_sign_height_seen as side effects.
         """
-        x0, y0, _, _ = roi_xywh
+        if not YOLO_AVAILABLE:
+            self.sign_visible = False
+            self.last_sign_height = 0
+            return 0, "", 0.0, None
 
-        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blur, 50, 150)
+        if self.model is None:
+            try:
+                self.model = YOLO(self.MODEL_PATH)
+            except Exception:
+                self.sign_visible = False
+                self.last_sign_height = 0
+                return 0, "", 0.0, None
 
-        raw_lines = cv2.HoughLinesP(
-            edges,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=35,
-            minLineLength=25,
-            maxLineGap=15,
-        )
+        try:
+            results = self.model(frame_bgr, conf=self.SIGN_DETECT_CONF, verbose=False)[0]
+        except Exception:
+            self.sign_visible = False
+            self.last_sign_height = 0
+            return 0, "", 0.0, None
 
-        intersection_lines = []
-        if raw_lines is not None:
-            for line in raw_lines[:6]:
-                x1, y1, x2, y2 = line[0]
-                intersection_lines.append((x0 + x1, y0 + y1, x0 + x2, y0 + y2))
+        best_height = 0
+        best_label = ""
+        best_conf = 0.0
+        best_bbox = None
 
-        center_point = (x0 + roi_bgr.shape[1] // 2, y0 + roi_bgr.shape[0] // 2)
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            h = y2 - y1
+            if h > best_height:
+                best_height = h
+                best_conf = float(box.conf)
+                best_label = results.names[int(box.cls)]
+                best_bbox = (x1, y1, x2 - x1, y2 - y1)  # xywh
 
-        result: Dict[str, Any] = {
-            "intersection_lines": intersection_lines,
-            "intersection_points": [center_point],
-            "intersection_boxes": [],
-            "intersection_label": "Scanning intersection ROI",
-            "debug": f"Team 2 phase={self.current_phase} lines={len(intersection_lines)}",
+        self.last_sign_height = best_height
+        self.sign_visible = best_height > 0
+        if best_height > self.max_sign_height_seen:
+            self.max_sign_height_seen = best_height
+
+        return best_height, best_label, best_conf, best_bbox
+
+    def detect_intersection_features(self) -> Dict[str, Any]:
+        """
+        Run YOLO sign detection and build the annotation payload.
+
+        YOLO runs on the full frame (stored in self._full_frame) rather than
+        the cropped ROI so the sign is visible at any distance.
+        """
+        sign_height, label, conf, bbox_xywh = self._run_yolo(self._full_frame)
+
+        boxes = [bbox_xywh] if bbox_xywh is not None else []
+
+        if sign_height >= self.SIGN_HEIGHT_THRESHOLD:
+            intersection_label = f"STOP — sign h={sign_height}px"
+        elif sign_height >= self.SIGN_READ_MIN_HEIGHT:
+            intersection_label = f"Reading sign — h={sign_height}px ({label} {conf:.2f})"
+        elif sign_height > 0:
+            intersection_label = f"Sign approaching — h={sign_height}px"
+        else:
+            intersection_label = "No sign detected"
+
+        return {
+            "intersection_lines": [],
+            "intersection_points": [],
+            "intersection_boxes": boxes,
+            "intersection_label": intersection_label,
+            "debug": f"Team 2 phase={self.current_phase} sign_h={sign_height} stage={self._current_stage}",
         }
-
-        return result
 
     def advance_phase_if_ready(
         self,
@@ -364,30 +422,68 @@ class Team2Intersection:
         self.current_phase = "SEEKING_INTERSECTION"
         self.phase_started_at = 0.0
         self.last_debug = debug_message
+        self.last_sign_height = 0
+        self.sign_visible = False
+        self.max_sign_height_seen = 0
+        self.forward_drive_started_at = 0.0
 
-    def sign_read_ready(self, detection: Dict[str, Any]) -> bool:
+    def sign_read_ready(self, _detection: Dict[str, Any]) -> bool:
         """
-        Placeholder cue for "close enough to start sign reading".
-        """
-        return len(detection.get("intersection_lines", []) or []) >= 2
+        True while the sign is in the reading window:
+            SIGN_READ_MIN_HEIGHT <= height < SIGN_HEIGHT_THRESHOLD
 
-    def pause_ready(self, detection: Dict[str, Any]) -> bool:
+        This gives Team 3 a clean window to classify the sign before the robot
+        reaches the stop point.  Once height crosses SIGN_HEIGHT_THRESHOLD the
+        robot is too close to read and this drops back to False.
         """
-        Placeholder cue for "robot has reached the pause point".
-        """
-        return len(detection.get("intersection_lines", []) or []) >= 3
+        return self.SIGN_READ_MIN_HEIGHT <= self.last_sign_height < self.SIGN_HEIGHT_THRESHOLD
 
-    def turn_ready(self, detection: Dict[str, Any]) -> bool:
+    def pause_ready(self, _detection: Dict[str, Any]) -> bool:
         """
-        Placeholder cue for "robot is centered enough in the intersection to turn".
+        True when the sign bounding-box height reaches SIGN_HEIGHT_THRESHOLD,
+        meaning the robot has arrived at the intersection stop point.
         """
-        return len(detection.get("intersection_lines", []) or []) >= 4
+        return self.last_sign_height >= self.SIGN_HEIGHT_THRESHOLD
 
-    def cleared_intersection(self, detection: Dict[str, Any]) -> bool:
+    def turn_ready(self, _detection: Dict[str, Any]) -> bool:
         """
-        Placeholder cue for "robot has exited the intersection and is back in lane".
+        True after the robot has been driving forward inside the intersection
+        for FORWARD_DRIVE_SECONDS.
+
+        The timer starts on the first frame where the controller reports
+        PRE_TURN_TRAVEL, which is when Team 1 actually begins driving forward
+        into the intersection after the pause action completes.  This mirrors
+        the standalone script's constant-time forward drive.
         """
-        return len(detection.get("intersection_lines", []) or []) <= 1
+        in_pre_turn = self._current_stage == IntersectionStage.PRE_TURN_TRAVEL.value
+
+        if in_pre_turn:
+            if self.forward_drive_started_at == 0.0:
+                self.forward_drive_started_at = self._current_timestamp
+        else:
+            # Reset timer whenever we leave PRE_TURN_TRAVEL so it starts fresh
+            # if the stage is re-entered.
+            self.forward_drive_started_at = 0.0
+
+        return (
+            self.forward_drive_started_at > 0.0
+            and (self._current_timestamp - self.forward_drive_started_at) >= self.FORWARD_DRIVE_SECONDS
+        )
+
+    def cleared_intersection(self, _detection: Dict[str, Any]) -> bool:
+        """
+        True when the sign disappears after having been tracked.
+
+        Two sub-cases — the intersection_label set in detect_intersection_features
+        distinguishes them on the display:
+
+        1. Normal exit: sign gone after turn_point_ready was reached.
+        2. Drove past: sign gone but the robot never entered PRE_TURN_TRAVEL,
+           meaning it passed the intersection without stopping.
+        """
+        sign_gone = not self.sign_visible
+        was_tracking = self.max_sign_height_seen >= self.SIGN_READ_MIN_HEIGHT
+        return sign_gone and was_tracking
 
     @staticmethod
     def parse_road_location(name: str) -> AutoRoadLocation:
@@ -404,7 +500,7 @@ class Team2Intersection:
 def run_intersection_worker(
     shm_name: str,
     image_shape: tuple[int, int, int],
-    frame_counter: Any,
+    _frame_counter: Any,
     canvas_lock: Any,
     input_q: Any,
     result_q: Any,
