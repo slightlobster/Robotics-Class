@@ -101,7 +101,7 @@ class RobotState:
     motion_mode: MotionMode = MotionMode.TEAM1_LANE_FOLLOW
     auto_current_imu_direction: float = 0.0
     auto_forward_speed: int = 80
-    auto_turn_speed: int = 80
+    auto_turn_speed: int = 45
     auto_sign_implemented: bool = False
     sign_locked: bool = False
     requested_speed: int = 0

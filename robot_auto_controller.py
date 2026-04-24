@@ -320,7 +320,7 @@ class AutonomousRobotController:
         self.first_camera_frame_logged = False
         self.first_display_frame_logged = False
 
-        self.saber.set_ramping(21)
+        self.saber.set_ramping(5)
 
         self.team1 = Team1NavigationIMU()
         self.team4 = Team4SignActions()
