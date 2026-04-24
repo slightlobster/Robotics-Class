@@ -15,8 +15,9 @@ advancing as Team 2 reports:
   - pause_point_ready    => POST_SIGN_TRAVEL -> PAUSE_ACTION  (simulated)
   - turn_point_ready     => PRE_TURN_TRAVEL  -> TURN_ACTION   (simulated)
 
-After each simulated action stage the controller immediately resets back
-to TRAVEL_LANE so the cycle can repeat.
+The full intersection sequence is exercised:
+  pause_point_ready  => stop, hold STOP_HOLD_SECONDS, enter PRE_TURN_TRAVEL
+  turn_point_ready   => stop, hold STOP_HOLD_SECONDS, reset to TRAVEL_LANE
 
 Teams 1, 3, and 4 are NOT imported or called.
 Sign-read timeout is disabled so SIGN_READ stays visible until Team 2
@@ -320,6 +321,7 @@ class AutonomousRobotController:
         # stays visible on the display until Team 2 fires the next milestone.
         self.sign_read_timeout = float("inf")
         self.creep_forward_speed = 35
+        self.stop_hold_seconds = 1.5
         self.stage_started_at = time.time()
 
         now = time.time()
@@ -615,18 +617,25 @@ class AutonomousRobotController:
         """
         Controller-owned stage rules for Team 2 testing.
 
-        - Sign-read timeout is DISABLED so SIGN_READ stays visible until
-          Team 2 fires pause_point_ready or turn_point_ready.
-        - PAUSE_ACTION and TURN_ACTION are immediately completed and reset
-          to TRAVEL_LANE so the cycle can repeat for the next intersection.
-        - The robot stays in CREEP_FORWARD the entire time.
+        Mirrors test_team2.py sequence:
+        - PAUSE_ACTION: stop, hold stop_hold_seconds, then enter PRE_TURN_TRAVEL
+        - TURN_ACTION: stop, hold stop_hold_seconds, then reset to TRAVEL_LANE
+        - Sign-read timeout is DISABLED so SIGN_READ stays until Team 2 advances.
         """
         if not self.state.auto_mode:
             return
 
-        # Immediately complete simulated action stages and loop back to TRAVEL_LANE.
-        if self.state.intersection_stage in (IntersectionStage.PAUSE_ACTION, IntersectionStage.TURN_ACTION):
-            self._finish_intersection_cycle("Team 2 test: action stage simulated; resetting to Travel Lane")
+        now = self.sensors.now or time.time()
+        elapsed = now - self.stage_started_at
+        stage = self.state.intersection_stage
+
+        if stage == IntersectionStage.PAUSE_ACTION:
+            if elapsed >= self.stop_hold_seconds:
+                self._enter_stage(IntersectionStage.PRE_TURN_TRAVEL, motion_mode=MotionMode.CREEP_FORWARD, debug_message="Pause complete => PRE_TURN_TRAVEL")
+
+        elif stage == IntersectionStage.TURN_ACTION:
+            if elapsed >= self.stop_hold_seconds:
+                self._finish_intersection_cycle("Turn complete => TRAVEL_LANE")
 
     def apply_team2_updates(self, updates: Dict[str, Any]) -> None:
         """
@@ -685,6 +694,10 @@ class AutonomousRobotController:
             self.last_motor_time = now
             return
         if self.state.intersection_stage == IntersectionStage.END_REACHED:
+            self.saber.stop()
+            self.last_motor_time = now
+            return
+        if self.state.intersection_stage in (IntersectionStage.PAUSE_ACTION, IntersectionStage.TURN_ACTION):
             self.saber.stop()
             self.last_motor_time = now
             return
